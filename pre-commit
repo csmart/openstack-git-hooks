@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# Copyright 2016, Chris Smart <chris@distroguy.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+## Test that we haven't broken things before we embarrass ourselves
+
+## Debug
+# Enable debug if DEBUG variable exists
+# e.g. DEBUG=true git commit
+if [[ -n "${DEBUG+DEBUG}" ]] ; then
+	set -x
+fi
+set -o pipefail
+set -o nounset
+
+## Skip tests and scripts if SKIP_TESTS variable exists
+# e.g. SKIP_TESTS=true git commit
+# Note: Can also be skipped with: git commit --no-verify
+if [[ -n "${SKIP_TESTS+SKIP}" ]] ; then
+	exit 0
+fi
+
+## Variables
+GIT_DIFF="$(git diff --name-only --cached)"
+SCRIPTS=""
+TESTS=""
+
+# Create a dictionary to match types of files with specific tox tests
+# e.g. structured text files (tox -e docs) or yml files (tox -e linters)
+declare -A FILES=(
+	["rst"]="docs"
+	["yml"]="linters"
+	["py"]="pep8 py27 py34"
+)
+
+## Functions
+# Common error message on failure
+function exit_error {
+	echo -e "\npre-commit hook: ${1} failed, commit aborted."
+	echo "Please take a look and retry commit."
+	exit 1
+}
+
+# Look for files to be committed that match tests and prompt user
+function scan_for_tests {
+	for file_type in "${!FILES[@]}" ; do
+		if ! grep -q "^.*\.${file_type}$" <<< "${GIT_DIFF}" ; then
+			continue
+		fi
+		echo "Found ${file_type} files in the commit, run tests:"
+		for test in ${FILES["${file_type}"]} ; do
+			echo -en "\t"
+			# Make sure the test is available in this repo
+			if ! egrep -q "^\[testenv:${test}\]|^envlist = .*${test}" tox.ini; then
+				echo "Test ${test} not found in tox.ini, skipping."
+				continue
+			fi
+			read -rep "tox -e ${test}? [y/N]: " answer
+			if [[ "${answer,,}" =~ y ]]; then
+				TESTS="${TESTS:+${TESTS}, }${test}"
+			fi
+		done
+	done
+}
+
+# Prompt user for comma separated list of any other tox tests to run
+function prompt_for_tests {
+	echo -en "Enter any additional tox tests, e.g.: functional, releasenotes\n\t"
+	read -rep "[]: " answer
+	if [[ -n "${answer}" ]]; then
+		TESTS="${TESTS:+${TESTS},} ${answer}"
+	fi
+}
+
+# Prompt user for comma separated list of any guides to build
+function prompt_for_guides {
+	echo -en "Enter any guides to build, e.g.: contributor-guide, install-guide\n\t"
+	read -rep "[]: " answer
+	if [[ -n "${answer}" ]]; then
+		TESTS="${TESTS:+${TESTS},} build -- ${answer}"
+	fi
+}
+
+
+# Prompt user for comma separated list of any scripts to run
+function prompt_for_scripts {
+	echo -en "Enter any scripts, e.g.: run_tests.sh, ~/my_test.sh\n\t"
+	read -rep "[]: " answer
+	if [[ -n "${answer}" ]]; then
+		SCRIPTS="${SCRIPTS:+${SCRIPTS},} ${answer}"
+	fi
+}
+
+## Main
+# Get user input
+exec < /dev/tty
+
+# Prompt user to run tests if we have files to commit
+if [[ -n "${GIT_DIFF}" ]] ; then
+	read -rep "Run some tests or scripts? [y/N]: " answer
+	if [[ ! "${answer,,}" =~ y ]]; then
+		exit 0
+	fi
+else
+	exit 0
+fi
+
+# Run tox tests only if we have the tox command
+if hash tox 2>/dev/null ; then
+	# For asettle, if we're in openstack-manuals, prompt to build guides
+	if [[ "$(basename "${PWD}")" == "openstack-manuals" ]]; then
+		prompt_for_guides
+	fi
+	# Ask if user wants to run any tox tests
+	scan_for_tests
+	prompt_for_tests
+else
+	echo "Sorry, can't find tox, skipping tests."
+fi
+
+# Ask if user wants to run any scripts
+prompt_for_scripts
+
+## Run tests
+IFS=","
+for test in ${TESTS} ; do
+	echo -e "\npre-commit hook: running tox -e ${test}\n"
+	tox -e "${test}" || exit_error "tox -e ${test}"
+done
+
+## Run scripts
+# This modifies PATH to look in local dir first and runs in a subshell to
+# expand any ~ in script path.
+for script in ${SCRIPTS} ; do
+	echo -e "\npre-commit hook: running script ${script}\n"
+	( eval PATH="${PWD}:${PATH}" "${script}" ) || exit_error "script ${script}"
+done
+
+## Final message
+# We only get here if everything passed or we didn't run any tests
+if [[ -n "${TESTS}" || -n "${SCRIPTS}" ]] ; then
+	echo -e "\nEverything passed. Great job!\n"
+else
+	echo -e "\nNo tests or scripts run, continuing.\n"
+fi
